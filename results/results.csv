@@ -1,4 +1,4 @@
-Barcode,FinishPosition,Time,Date
+id,position,time,date
 A-123,0001,00:19:32,21/11/2025
 A-124,0002,00:22:10,21/11/2025
 A-125,0003,00:23:02,21/11/2025
