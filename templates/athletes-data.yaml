@@ -1,0 +1,214 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  Populate/update Athletes DynamoDB table from CSV uploaded to an existing S3 bucket.
+  Automatically sets up S3 event notification to trigger Lambda using a custom resource.
+
+Parameters:
+  AthletesCsvBucketName:
+    Type: String
+    Description: "Name of the existing S3 bucket for athlete CSV uploads"
+    Default: "ranelagh-athletes-data-csv"
+
+Resources:
+
+  ##########################################
+  # DynamoDB Table: Athletes
+  ##########################################
+  AthletesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Athletes
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: Barcode
+          AttributeType: S
+      KeySchema:
+        - AttributeName: Barcode
+          KeyType: HASH
+
+  ##########################################
+  # IAM Role for Lambda
+  ##########################################
+  AthletesLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AthletesCsvLambdaRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBWritePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt AthletesTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${AthletesCsvBucketName}/*"
+
+  ##########################################
+  # Lambda Function: Process CSV and populate DynamoDB
+  ##########################################
+  AthletesCsvLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AthletesCsvProcessor
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt AthletesLambdaRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import csv
+          import io
+          import os
+
+          dynamodb = boto3.client("dynamodb")
+          ATHLETES_TABLE = "Athletes"
+          BUCKET_NAME = os.environ['BUCKET_NAME']
+
+          def lambda_handler(event, context):
+              records = event.get("Records", [])
+              saved = 0
+              for record in records:
+                  key = record['s3']['object']['key']
+                  s3 = boto3.client("s3")
+                  obj = s3.get_object(Bucket=BUCKET_NAME, Key=key)
+                  csv_data = obj['Body'].read().decode('utf-8')
+                  reader = csv.DictReader(io.StringIO(csv_data))
+                  for row in reader:
+                      barcode = row['ID'].strip()
+                      first_name = row.get('First Name', '').strip()
+                      last_name = row.get('Surname', '').strip()
+                      dob = row.get('Date of Birth', '').strip()
+                      age = row.get('Age', '').strip()
+                      sex = row.get('Sex', '').strip()
+                      item = {
+                          "Barcode": {"S": barcode},
+                          "FirstName": {"S": first_name},
+                          "LastName": {"S": last_name},
+                          "DateOfBirth": {"S": dob},
+                          "Age": {"N": str(age) if age else "0"},
+                          "Sex": {"S": sex}
+                      }
+                      dynamodb.put_item(TableName=ATHLETES_TABLE, Item=item)
+                      saved += 1
+              return {"statusCode": 200, "body": f"Processed {saved} athletes"}
+
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref AthletesCsvBucketName
+
+  ##########################################
+  # Permission for S3 to invoke Lambda
+  ##########################################
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AthletesCsvLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::${AthletesCsvBucketName}"
+
+  ##########################################
+  # Custom Resource Lambda Role
+  ##########################################
+  S3EventLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: S3EventSetupRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3EventSetupPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketNotification
+                  - s3:GetBucketNotification
+                Resource: !Sub "arn:aws:s3:::${AthletesCsvBucketName}"
+
+  ##########################################
+  # Custom Resource Lambda: Configure S3 Event
+  ##########################################
+  S3EventSetupLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: S3EventSetup
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt S3EventLambdaRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import os
+
+          def handler(event, context):
+              s3 = boto3.client("s3")
+              physical_id = "S3EventSetup"
+              try:
+                  bucket = os.environ['BUCKET_NAME']
+                  lambda_arn = os.environ['LAMBDA_ARN']
+                  if event['RequestType'] in ['Create', 'Update']:
+                      notification = {
+                          'LambdaFunctionConfigurations': [
+                              {
+                                  'LambdaFunctionArn': lambda_arn,
+                                  'Events': ['s3:ObjectCreated:*']
+                              }
+                          ]
+                      }
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration=notification
+                      )
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_id)
+              except Exception as e:
+                  print("Error configuring S3 event:", e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, physical_id)
+
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref AthletesCsvBucketName
+          LAMBDA_ARN: !GetAtt AthletesCsvLambda.Arn
+
+  ##########################################
+  # Custom Resource: Trigger S3 Event Setup
+  ##########################################
+  ConfigureS3Event:
+    Type: Custom::S3EventSetup
+    Properties:
+      ServiceToken: !GetAtt S3EventSetupLambda.Arn
+
+Outputs:
+
+  AthletesTableName:
+    Description: "DynamoDB table name for athletes"
+    Value: !Ref AthletesTable
+
+  AthletesCsvBucketName:
+    Description: "Existing S3 bucket used for athlete CSV uploads"
+    Value: !Ref AthletesCsvBucketName

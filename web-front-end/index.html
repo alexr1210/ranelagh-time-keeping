@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ranelagh Harriers Race Results</title>
+<style>
+  :root {
+    --ranelagh-blue: #0B203D;
+    --ranelagh-gold: #FFC845;
+    --ranelagh-light: #F9F9F9;
+    --ranelagh-dark-text: #333333;
+    --winner-bg: #FFF3BF;
+  }
+
+  body {
+    font-family: Arial, sans-serif;
+    background: var(--ranelagh-light);
+    color: var(--ranelagh-dark-text);
+    margin: 20px;
+  }
+
+  header {
+    text-align: center;
+    margin-bottom: 20px;
+  }
+
+  header img {
+    height: 100px;
+    margin-bottom: 10px;
+    object-fit: contain;
+  }
+
+  h1 {
+    color: var(--ranelagh-blue);
+    font-size: 2em;
+    margin: 0;
+  }
+
+  #searchContainer {
+    text-align: center;
+    margin-bottom: 15px;
+  }
+
+  #searchInput {
+    padding: 8px;
+    width: 220px;
+    border: 1px solid var(--ranelagh-blue);
+    border-radius: 4px;
+  }
+
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    max-width: 900px;
+    margin: auto;
+    background: white;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+  }
+
+  th, td {
+    padding: 12px;
+    text-align: center;
+    border-bottom: 1px solid #ddd;
+  }
+
+  th {
+    cursor: pointer;
+    background: var(--ranelagh-blue);
+    color: var(--ranelagh-gold);
+    position: relative;
+  }
+
+  th.sort-asc::after { content: " ▲"; }
+  th.sort-desc::after { content: " ▼"; }
+
+  tr:nth-child(even) { background: #f9f9f9; }
+  tr:hover { background: #f1f1f1; }
+
+  tr.winner {
+    background: var(--winner-bg);
+    font-weight: bold;
+  }
+
+  .loading, .error {
+    text-align: center;
+    font-size: 18px;
+    margin-top: 20px;
+  }
+
+  .spinner {
+    border: 4px solid #f3f3f3;
+    border-top: 4px solid var(--ranelagh-blue);
+    border-radius: 50%;
+    width: 24px;
+    height: 24px;
+    display: inline-block;
+    animation: spin 1s linear infinite;
+    margin-left: 10px;
+  }
+
+  @keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+  }
+
+  @media (max-width: 600px) {
+    th, td {
+      padding: 8px;
+      font-size: 0.9em;
+    }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <!-- LOCAL LOGO FROM YOUR FRONTEND BUCKET -->
+  <img src="/images/rh.crest.yellow.01.large.png" alt="Ranelagh Harriers Logo">
+  <h1>Race Results Leaderboard</h1>
+</header>
+
+<div id="searchContainer">
+  <input type="text" id="searchInput" placeholder="Search by name or id" oninput="filterTable()">
+</div>
+
+<div class="loading" id="loading">
+  Loading results<span class="spinner"></span>
+</div>
+<div class="error" id="error" style="display:none;"></div>
+
+<table id="resultsTable" style="display:none;">
+  <thead>
+    <tr>
+      <th onclick="sortTable(0)">First Name</th>
+      <th onclick="sortTable(1)">Last Name</th>
+      <th onclick="sortTable(2)">Finish Position</th>
+      <th onclick="sortTable(3)">Time</th>
+      <th onclick="sortTable(4)">Date</th>
+    </tr>
+  </thead>
+  <tbody></tbody>
+</table>
+
+<script>
+const apiUrl = "https://1vq6wlce87.execute-api.eu-west-2.amazonaws.com/prod/results";
+let currentSortColumn = -1;
+let sortDirection = 'asc';
+
+async function fetchResults() {
+    try {
+        const response = await fetch(apiUrl);
+        if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
+        const data = await response.json();
+
+        const table = document.getElementById("resultsTable");
+        const tbody = table.querySelector("tbody");
+        tbody.innerHTML = "";
+
+        data.forEach((row, index) => {
+            const tr = document.createElement("tr");
+            if (index === 0) tr.classList.add("winner");
+            tr.innerHTML = `
+                <td>${row.FirstName}</td>
+                <td>${row.LastName}</td>
+                <td>${row.FinishPosition}</td>
+                <td>${row.Time}</td>
+                <td>${row.Date}</td>
+            `;
+            tbody.appendChild(tr);
+        });
+
+        document.getElementById("loading").style.display = "none";
+        table.style.display = "table";
+    } catch (error) {
+        document.getElementById("loading").style.display = "none";
+        const err = document.getElementById("error");
+        err.style.display = "block";
+        err.textContent = "Error fetching race results.";
+        console.error("Error fetching race results:", error);
+    }
+}
+
+function sortTable(n) {
+    const table = document.getElementById("resultsTable");
+    const rows = Array.from(table.rows).slice(1);
+    const tbody = table.querySelector("tbody");
+
+    if (currentSortColumn === n) {
+        sortDirection = (sortDirection === 'asc') ? 'desc' : 'asc';
+    } else {
+        currentSortColumn = n;
+        sortDirection = 'asc';
+    }
+
+    table.querySelectorAll("th").forEach(th => th.classList.remove("sort-asc", "sort-desc"));
+    table.querySelectorAll("th")[n].classList.add(sortDirection === 'asc' ? 'sort-asc' : 'sort-desc');
+
+    rows.sort((a, b) => {
+        let x = a.cells[n].textContent;
+        let y = b.cells[n].textContent;
+
+        if (!isNaN(x) && !isNaN(y)) {
+            x = parseFloat(x);
+            y = parseFloat(y);
+        }
+        return (x > y ? 1 : -1) * (sortDirection === 'asc' ? 1 : -1);
+    });
+
+    rows.forEach(row => tbody.appendChild(row));
+}
+
+function filterTable() {
+    const filter = document.getElementById("searchInput").value.toLowerCase();
+    const rows = document.getElementById("resultsTable").getElementsByTagName("tr");
+
+    for (let i = 1; i < rows.length; i++) {
+        const cells = rows[i].getElementsByTagName("td");
+        let match = false;
+        for (let j = 0; j < cells.length; j++) {
+            if (cells[j].textContent.toLowerCase().includes(filter)) {
+                match = true;
+                break;
+            }
+        }
+        rows[i].style.display = match ? "" : "none";
+    }
+}
+
+fetchResults();
+</script>
+
+</body>
+</html>

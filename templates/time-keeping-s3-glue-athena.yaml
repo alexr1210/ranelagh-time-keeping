@@ -1,0 +1,326 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Race results backend pipeline (Athena + Lambda + Glue + API + CloudFront)
+
+Parameters:
+  ResultsBucketName:
+    Type: String
+    Description: S3 bucket containing uploaded race results CSV files
+    Default: ranelagh-results-csv
+
+  FrontendBucketName:
+    Type: String
+    Description: S3 bucket that stores the static web frontend
+    Default: ranelagh-results-frontend
+
+  AthenaOutputBucket:
+    Type: String
+    Description: S3 bucket where Athena query results are written
+    Default: ranelagh-athena-output
+
+  AthletesTableName:
+    Type: String
+    Default: Athletes
+    Description: DynamoDB table containing registered athletes
+
+Resources:
+
+  ########################################
+  # Glue: Database + Table
+  ########################################
+  RaceResultsDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: race_results_db
+        Description: Database for processed race result data
+
+  RaceResultsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref RaceResultsDatabase
+      TableInput:
+        Name: race_results_clean
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          EXTERNAL: "TRUE"
+        StorageDescriptor:
+          Columns:
+            - { Name: id, Type: string }
+            - { Name: position, Type: int }
+            - { Name: time, Type: string }
+            - { Name: date, Type: string }
+          Location: !Sub "s3://${ResultsBucketName}/clean/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.serde2.OpenCSVSerde
+            Parameters:
+              separatorChar: ","
+              skip.header.line.count: "1"
+
+  ########################################
+  # IAM Role for Lambda
+  ########################################
+  ResultsApiLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ResultsApiLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+      Policies:
+        - PolicyName: ResultsApiLambdaInlinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # DynamoDB lookup
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AthletesTableName}"
+
+              # Athena read/query
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                Resource: "*"
+
+              # Glue metadata lookup (DB/table metadata only)
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                Resource: "*"
+
+              # Access to race results S3 bucket
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${ResultsBucketName}"
+                  - !Sub "arn:aws:s3:::${ResultsBucketName}/clean/*"
+
+              # Access to Athena output bucket
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "arn:aws:s3:::${AthenaOutputBucket}"
+                  - !Sub "arn:aws:s3:::${AthenaOutputBucket}/*"
+
+  ########################################
+  # Lambda – API backend
+  ########################################
+  ResultsApiLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ResultsApiLambda
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt ResultsApiLambdaRole.Arn
+      Timeout: 60
+
+      Environment:
+        Variables:
+          ATHENA_DB: race_results_db
+          ATHENA_TABLE: race_results_clean
+          ATHENA_OUTPUT: !Sub "s3://${AthenaOutputBucket}/queries/"
+          ATHLETES_TABLE: !Ref AthletesTableName
+
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import time
+          import os
+
+          # Clients
+          athena = boto3.client("athena")
+          dynamodb = boto3.client("dynamodb")
+
+          # Environment variables
+          ATHENA_DB = os.environ["ATHENA_DB"]
+          ATHENA_TABLE = os.environ["ATHENA_TABLE"]
+          ATHENA_OUTPUT = os.environ["ATHENA_OUTPUT"]
+          ATHLETES_TABLE = os.environ["ATHLETES_TABLE"]
+
+          # Athena SQL
+          SQL = f"""
+          SELECT id, position, time, date
+          FROM {ATHENA_DB}.{ATHENA_TABLE}
+          ORDER BY CAST(position AS INTEGER) ASC
+          """
+
+          def lambda_handler(event, context):
+              # Handle CORS preflight
+              if event.get("httpMethod") == "OPTIONS":
+                  return {
+                      "statusCode": 200,
+                      "headers": {
+                          "Access-Control-Allow-Origin": "*",
+                          "Access-Control-Allow-Methods": "GET, OPTIONS",
+                          "Access-Control-Allow-Headers": "Content-Type"
+                      },
+                      "body": ""
+                  }
+
+              # Start Athena query
+              query_id = athena.start_query_execution(
+                  QueryString=SQL,
+                  QueryExecutionContext={"Database": ATHENA_DB},
+                  ResultConfiguration={"OutputLocation": ATHENA_OUTPUT}
+              )["QueryExecutionId"]
+
+              # Wait for query to complete
+              while True:
+                  status = athena.get_query_execution(QueryExecutionId=query_id)["QueryExecution"]["Status"]["State"]
+                  if status in ("SUCCEEDED", "FAILED", "CANCELLED"):
+                      break
+                  time.sleep(0.2)
+
+              if status != "SUCCEEDED":
+                  return {
+                      "statusCode": 500,
+                      "headers": {"Access-Control-Allow-Origin": "*"},
+                      "body": "Athena query failed"
+                  }
+
+              # Fetch results (skip header row)
+              rows = athena.get_query_results(QueryExecutionId=query_id)["ResultSet"]["Rows"][1:]
+
+              results = []
+              for row in rows:
+                  id_val, pos_val, time_val, date_val = [c["VarCharValue"] for c in row["Data"]]
+
+                  # DynamoDB lookup for athlete info
+                  d = dynamodb.get_item(
+                      TableName=ATHLETES_TABLE,
+                      Key={"Barcode": {"S": id_val}}
+                  )
+                  item = d.get("Item", {})
+                  first = item.get("FirstName", {}).get("S", "")
+                  last = item.get("LastName", {}).get("S", "")
+
+                  results.append({
+                      "id": id_val,
+                      "FirstName": first,
+                      "LastName": last,
+                      "FinishPosition": int(pos_val),
+                      "Time": time_val,
+                      "Date": date_val
+                  })
+
+              return {
+                  "statusCode": 200,
+                  "headers": {
+                      "Content-Type": "application/json",
+                      "Access-Control-Allow-Origin": "*",
+                      "Access-Control-Allow-Methods": "GET, OPTIONS",
+                      "Access-Control-Allow-Headers": "Content-Type"
+                  },
+                  "body": json.dumps(results)
+              }
+
+  ########################################
+  # API Gateway
+  ########################################
+  ResultsApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: RaceResultsAPI
+      EndpointConfiguration:
+        Types: [REGIONAL]
+
+  ResultsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ResultsApi
+      ParentId: !GetAtt ResultsApi.RootResourceId
+      PathPart: results
+
+  ResultsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ResultsApi
+      ResourceId: !Ref ResultsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ResultsApiLambda.Arn}/invocations"
+
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ResultsApiLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+  ########################################
+  # CloudFront (OAC)
+  ########################################
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: FrontendOAC
+        OriginAccessControlOriginType: s3
+        SigningProtocol: sigv4
+        SigningBehavior: always
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: "Race Results Frontend"
+        DefaultRootObject: index.html
+        Origins:
+          - Id: FrontendS3Origin
+            DomainName: !Sub "${FrontendBucketName}.s3.${AWS::Region}.amazonaws.com"
+            OriginAccessControlId: !Ref FrontendOAC
+            S3OriginConfig: {}
+        DefaultCacheBehavior:
+          TargetOriginId: FrontendS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods:  [GET, HEAD]
+          ForwardedValues:
+            QueryString: true
+            Cookies:
+              Forward: none
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        PriceClass: PriceClass_100
+
+Outputs:
+  ApiURL:
+    Description: API URL for results
+    Value: !Sub "https://${ResultsApi}.execute-api.${AWS::Region}.amazonaws.com/prod/results"
+
+  CloudFrontURL:
+    Description: CloudFront distribution domain
+    Value: !GetAtt FrontendDistribution.DomainName
+
+  GlueDatabase:
+    Description: Glue DB name
+    Value: !Ref RaceResultsDatabase
