@@ -2,16 +2,23 @@ import json
 import uuid
 import base64
 import boto3
-import qrcode
-from io import BytesIO
 import os
+from io import BytesIO
 
-s3 = boto3.client('s3')
+import qrcode
+from qrcode.image.pil import PilImage  # Use Pillow explicitly
 
+# Initialize S3 client
+s3 = boto3.client("s3")
+
+# Environment variables
 BUCKET_NAME = os.environ.get("BUCKET_NAME", "ranelagh-results-csv2")
 UPLOAD_PREFIX = os.environ.get("UPLOAD_PREFIX", "uploads/")
 
 def generate_qr_png(data: str) -> str:
+    """
+    Generates a QR code PNG using Pillow and returns it as base64 string.
+    """
     qr = qrcode.QRCode(
         version=1,
         error_correction=qrcode.constants.ERROR_CORRECT_M,
@@ -20,29 +27,38 @@ def generate_qr_png(data: str) -> str:
     )
     qr.add_data(data)
     qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
+
+    # Use Pillow image factory
+    img = qr.make_image(image_factory=PilImage, fill_color="black", back_color="white")
+
     buffer = BytesIO()
-    img.save(buffer, format="PNG")
+    img.save(buffer)  # Pillow handles PNG format automatically
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 def lambda_handler(event, context):
+    """
+    Lambda entry point: generates a unique token, a pre-signed S3 PUT URL,
+    and a QR code representing the token.
+    """
     # Unique token for this upload
     token = str(uuid.uuid4())
     object_key = f"{UPLOAD_PREFIX}{token}.csv"
 
-    # Pre-signed URL for S3 PUT
+    # Generate pre-signed URL for S3 PUT
     presigned_url = s3.generate_presigned_url(
-        ClientMethod='put_object',
+        ClientMethod="put_object",
         Params={
             "Bucket": BUCKET_NAME,
             "Key": object_key,
             "ContentType": "text/csv"
         },
-        ExpiresIn=300
+        ExpiresIn=300  # 5 minutes
     )
 
+    # Generate QR code as base64
     qr_png_b64 = generate_qr_png(token)
 
+    # Return response
     return {
         "statusCode": 200,
         "headers": {"Content-Type": "application/json"},
