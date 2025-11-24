@@ -1,0 +1,348 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Race results backend pipeline (Athena + Lambda + Glue + API + CloudFront)
+
+Parameters:
+  ResultsBucketName:
+    Type: String
+    Default: ranelagh-results-csv2
+    Description: S3 bucket containing uploaded race CSV files
+
+  FrontendBucketName:
+    Type: String
+    Default: ranelagh-results-frontend2
+    Description: S3 bucket for static frontend
+
+  AthenaOutputBucket:
+    Type: String
+    Default: ranelagh-athena-output2
+    Description: S3 bucket for Athena query output
+
+  AthletesTableName:
+    Type: String
+    Default: Athletes
+    Description: DynamoDB table for athlete info
+
+Resources:
+
+  ########################################
+  # Glue: Database + Timer/Position Tables
+  ########################################
+  RaceResultsDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: race_results_db2
+        Description: Database for processed race result data
+
+  TimerResultsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref RaceResultsDatabase
+      TableInput:
+        Name: timer_results
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          EXTERNAL: "TRUE"
+        StorageDescriptor:
+          Columns:
+            - { Name: internal_id, Type: string }
+            - { Name: start_time, Type: string }
+            - { Name: finish_time, Type: string }
+            - { Name: elapsed, Type: string }
+            - { Name: batch_id, Type: string }
+          Location: !Sub "s3://${ResultsBucketName}/timer/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.serde2.OpenCSVSerde
+            Parameters:
+              separatorChar: ","
+              skip.header.line.count: "1"
+
+  PositionResultsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref RaceResultsDatabase
+      TableInput:
+        Name: position_results
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          EXTERNAL: "TRUE"
+        StorageDescriptor:
+          Columns:
+            - { Name: barcode, Type: string }
+            - { Name: finish_position, Type: int }
+            - { Name: finish_time, Type: string }
+            - { Name: batch_id, Type: string }
+          Location: !Sub "s3://${ResultsBucketName}/position/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.serde2.OpenCSVSerde
+            Parameters:
+              separatorChar: ","
+              skip.header.line.count: "1"
+
+  ########################################
+  # IAM Role for Lambda
+  ########################################
+  ResultsApiLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ResultsApiLambdaRole2
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ResultsApiLambdaInlinePolicy2
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AthletesTableName}"
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${ResultsBucketName}"
+                  - !Sub "arn:aws:s3:::${ResultsBucketName}/clean/*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "arn:aws:s3:::${AthenaOutputBucket}"
+                  - !Sub "arn:aws:s3:::${AthenaOutputBucket}/*"
+
+  ########################################
+  # Lambda: Merge Timer + Position + Athlete
+  ########################################
+  ResultsApiLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ResultsApiLambda2
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt ResultsApiLambdaRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          ATHENA_DB: race_results_db2
+          ATHENA_TIMER_TABLE: timer_results
+          ATHENA_POSITION_TABLE: position_results
+          ATHENA_OUTPUT: !Sub "s3://${AthenaOutputBucket}/queries/"
+          ATHLETES_TABLE: !Ref AthletesTableName
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import time
+          import os
+
+          athena = boto3.client("athena")
+          dynamodb = boto3.client("dynamodb")
+
+          ATHENA_DB = os.environ["ATHENA_DB"]
+          ATHENA_TIMER_TABLE = os.environ["ATHENA_TIMER_TABLE"]
+          ATHENA_POSITION_TABLE = os.environ["ATHENA_POSITION_TABLE"]
+          ATHENA_OUTPUT = os.environ["ATHENA_OUTPUT"]
+          ATHLETES_TABLE = os.environ["ATHLETES_TABLE"]
+
+          def lambda_handler(event, context):
+              batch_id = event.get("queryStringParameters", {}).get("batch_id", None)
+              if not batch_id:
+                  return {"statusCode":400,"body":"Missing batch_id"}
+
+              if event.get("httpMethod") == "OPTIONS":
+                  return {
+                      "statusCode": 200,
+                      "headers": {
+                          "Access-Control-Allow-Origin": "*",
+                          "Access-Control-Allow-Methods": "GET, OPTIONS",
+                          "Access-Control-Allow-Headers": "Content-Type"
+                      },
+                      "body": ""
+                  }
+
+              SQL = f"""
+              WITH timer AS (
+                  SELECT *
+                  FROM {ATHENA_DB}.{ATHENA_TIMER_TABLE}
+                  WHERE batch_id='{batch_id}'
+              ),
+              position AS (
+                  SELECT *
+                  FROM {ATHENA_DB}.{ATHENA_POSITION_TABLE}
+                  WHERE batch_id='{batch_id}'
+              )
+              SELECT p.barcode, p.finish_position, t.start_time, t.finish_time
+              FROM position p
+              LEFT JOIN timer t
+              ON p.barcode = t.internal_id
+              ORDER BY p.finish_position
+              """
+
+              query_id = athena.start_query_execution(
+                  QueryString=SQL,
+                  QueryExecutionContext={"Database": ATHENA_DB},
+                  ResultConfiguration={"OutputLocation": ATHENA_OUTPUT}
+              )["QueryExecutionId"]
+
+              while True:
+                  status = athena.get_query_execution(QueryExecutionId=query_id)["QueryExecution"]["Status"]["State"]
+                  if status in ("SUCCEEDED","FAILED","CANCELLED"):
+                      break
+                  time.sleep(0.2)
+
+              if status != "SUCCEEDED":
+                  return {"statusCode":500,"headers":{"Access-Control-Allow-Origin":"*"},"body":"Athena query failed"}
+
+              rows = athena.get_query_results(QueryExecutionId=query_id)["ResultSet"]["Rows"][1:]
+
+              results = []
+              for row in rows:
+                  # Handle missing or empty columns safely
+                  data = [c.get("VarCharValue","") for c in row["Data"]]
+                  if len(data) < 4: continue
+                  barcode, finish_position, start_time, finish_time = data
+
+                  athlete_item = {}
+                  if barcode:
+                      d = dynamodb.get_item(
+                          TableName=ATHLETES_TABLE,
+                          Key={"Barcode":{"S":barcode}}
+                      )
+                      athlete_item = d.get("Item", {})
+
+                  results.append({
+                      "Barcode": barcode,
+                      "FirstName": athlete_item.get("FirstName", {}).get("S",""),
+                      "LastName": athlete_item.get("LastName", {}).get("S",""),
+                      "FinishPosition": int(finish_position) if finish_position else None,
+                      "StartTime": start_time,
+                      "FinishTime": finish_time
+                  })
+
+              return {
+                  "statusCode": 200,
+                  "headers": {
+                      "Content-Type": "application/json",
+                      "Access-Control-Allow-Origin": "*",
+                      "Access-Control-Allow-Methods": "GET, OPTIONS",
+                      "Access-Control-Allow-Headers": "Content-Type"
+                  },
+                  "body": json.dumps(results)
+              }
+
+  ########################################
+  # API Gateway
+  ########################################
+  ResultsApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: RaceResultsAPI2
+      EndpointConfiguration:
+        Types: [REGIONAL]
+
+  ResultsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ResultsApi
+      ParentId: !GetAtt ResultsApi.RootResourceId
+      PathPart: results
+
+  ResultsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ResultsApi
+      ResourceId: !Ref ResultsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ResultsApiLambda.Arn}/invocations"
+
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ResultsApiLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+  ########################################
+  # CloudFront
+  ########################################
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: FrontendOAC2
+        OriginAccessControlOriginType: s3
+        SigningProtocol: sigv4
+        SigningBehavior: always
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: "Race Results Frontend"
+        DefaultRootObject: index.html
+        Origins:
+          - Id: FrontendS3Origin
+            DomainName: !Sub "${FrontendBucketName}.s3.${AWS::Region}.amazonaws.com"
+            OriginAccessControlId: !Ref FrontendOAC
+            S3OriginConfig: {}
+        DefaultCacheBehavior:
+          TargetOriginId: FrontendS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods:  [GET, HEAD]
+          ForwardedValues:
+            QueryString: true
+            Cookies:
+              Forward: none
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        PriceClass: PriceClass_100
+
+Outputs:
+  ApiURL:
+    Description: API URL for results
+    Value: !Sub "https://${ResultsApi}.execute-api.${AWS::Region}.amazonaws.com/prod/results"
+
+  CloudFrontURL:
+    Description: CloudFront distribution domain
+    Value: !GetAtt FrontendDistribution.DomainName
+
+  GlueDatabase:
+    Description: Glue DB name
+    Value: !Ref RaceResultsDatabase

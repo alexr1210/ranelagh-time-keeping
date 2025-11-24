@@ -1,0 +1,118 @@
+Resources:
+  PreprocessLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: PreprocessLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource: "*"
+
+  PreprocessLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: PreprocessLambda
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt PreprocessLambdaRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          POSITION_BUCKET: ranelagh-results-csv2
+          TIMER_BUCKET: ranelagh-results-csv2
+          OUTPUT_BUCKET: ranelagh-results-csv2
+      Code:
+        ZipFile: |
+          import boto3, csv, io, os, re
+          from datetime import datetime
+
+          s3 = boto3.client("s3")
+
+          POSITION_PREFIX = "position_results/"
+          TIMER_PREFIX = "timer_results/"
+          OUTPUT_PREFIX = "clean/"
+
+          def parse_time_string(time_str):
+              # Convert HH:MM:SS to timedelta string if needed
+              return time_str.strip()
+
+          def lambda_handler(event, context):
+              # List files in position bucket
+              pos_files = s3.list_objects_v2(Bucket=os.environ['POSITION_BUCKET'], Prefix=POSITION_PREFIX).get("Contents", [])
+              timer_files = s3.list_objects_v2(Bucket=os.environ['TIMER_BUCKET'], Prefix=TIMER_PREFIX).get("Contents", [])
+
+              for pos_file in pos_files:
+                  pos_key = pos_file['Key']
+                  batch_match = re.search(r'(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})', pos_key)
+                  batch_id = batch_match.group(1) if batch_match else "unknown"
+
+                  # Find matching timer file
+                  timer_key = None
+                  for t_file in timer_files:
+                      if batch_id in t_file['Key']:
+                          timer_key = t_file['Key']
+                          break
+                  if not timer_key:
+                      continue  # skip if no matching timer file
+
+                  # Load position file
+                  pos_obj = s3.get_object(Bucket=os.environ['POSITION_BUCKET'], Key=pos_key)
+                  pos_lines = pos_obj['Body'].read().decode('utf-8').splitlines()
+                  pos_reader = csv.reader(pos_lines)
+                  pos_data = {}
+                  next(pos_reader)  # skip header if exists
+                  for row in pos_reader:
+                      if len(row) < 1 or not row[0].strip():
+                          continue
+                      barcode = row[0].strip()
+                      position = row[1].strip() if len(row) > 1 else ""
+                      finish_time = row[2].strip() if len(row) > 2 else ""
+                      pos_data[barcode] = {"position": position, "finish_time": finish_time}
+
+                  # Load timer file
+                  timer_obj = s3.get_object(Bucket=os.environ['TIMER_BUCKET'], Key=timer_key)
+                  timer_lines = timer_obj['Body'].read().decode('utf-8').splitlines()
+                  timer_reader = csv.reader(timer_lines)
+                  timer_data = {}
+                  start_time = None
+                  for row in timer_reader:
+                      if row[0].startswith("STARTOFEVENT"):
+                          start_time = row[1].strip()
+                      elif row[0].isdigit() and len(row) > 2:
+                          timer_data[int(row[0])] = row[2].strip()  # delta time if needed
+
+                  # Merge results
+                  output_rows = []
+                  for barcode, info in pos_data.items():
+                      output_rows.append([
+                          barcode,
+                          info["position"] or "",
+                          info["finish_time"] or "",
+                          batch_id
+                      ])
+
+                  # Write to S3
+                  output_csv = io.StringIO()
+                  writer = csv.writer(output_csv)
+                  writer.writerow(["id","position","time","date"])
+                  writer.writerows(output_rows)
+                  output_key = f"{OUTPUT_PREFIX}{batch_id}.csv"
+                  s3.put_object(Bucket=os.environ['OUTPUT_BUCKET'], Key=output_key, Body=output_csv.getvalue())
+
+              return {"status": "success"}
